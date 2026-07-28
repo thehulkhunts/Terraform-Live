@@ -1,0 +1,32 @@
+name: Terraform - QA
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'environments/qa/**'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'environments/qa/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action'
+        required: true
+        type: choice
+        default: 'plan'
+        options: [plan, apply, destroy]
+      confirm_destroy:
+        description: 'Type "destroy" to confirm destruction (only used when action=destroy)'
+        required: false
+        default: ''
+
+jobs:
+  terraform:
+    uses: ./.github/workflows/terraform-reusable.yml
+    with:
+      environment: qa
+      action: ${{ github.event.inputs.action || 'plan' }}
+      confirm_destroy: ${{ github.event.inputs.confirm_destroy || '' }}
+    secrets: inherit

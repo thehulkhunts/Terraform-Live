@@ -1,0 +1,199 @@
+name: Terraform Reusable Workflow
+
+# Called by terraform-dev.yml / terraform-qa.yml / terraform-prod.yml.
+# Behaviour (same for every environment):
+#   PR touching environments/<env>/**            -> plan only
+#   Push to master touching environments/<env>/** -> plan, then apply (waits on the
+#                                                    GitHub Environment approval gate)
+#   Push to any other branch                     -> plan only (safety net)
+#   workflow_dispatch                             -> plan / apply / destroy on demand
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment name. Must match the environments/<environment> folder and a GitHub Environment of the same name.'
+        required: true
+        type: string
+      action:
+        description: 'Terraform action for manual runs (plan, apply, destroy)'
+        required: false
+        type: string
+        default: 'plan'
+      confirm_destroy:
+        description: 'Must equal "destroy" to allow the destroy job to run'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.15.6'
+  AWS_REGION: 'ap-south-1'
+  TF_WORKING_DIR: environments/${{ inputs.environment }}
+
+# One concurrency lane per environment so dev/qa/prod never block each other,
+# but two runs against the *same* environment queue instead of racing.
+concurrency:
+  group: terraform-${{ inputs.environment }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------- plan ----------
+  plan:
+    name: "Terraform plan (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Static keys for now - swap to an OIDC role-to-assume for production use.
+
+      - name: Terraform format check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform init
+        id: init
+        run: terraform init
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -out=tfplan \
+            -no-color
+        continue-on-error: true
+
+      - name: Fail job if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Release state lock on failure
+        if: failure() || cancelled()
+        run: |
+          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
+
+      - name: Upload plan artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  # ---------- apply ----------
+  apply:
+    name: "Terraform apply (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+    environment: ${{ inputs.environment }}   # <- pauses for the environment's required reviewers
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -no-color \
+            tfplan
+
+      - name: Release state lock on failure
+        if: failure() || cancelled()
+        run: |
+          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
+
+  # ---------- destroy ----------
+  destroy:
+    name: "Terraform destroy (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      inputs.action == 'destroy' &&
+      inputs.confirm_destroy == 'destroy'
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform destroy
+        run: |
+          terraform destroy \
+            -var-file=terraform.tfvars \
+            -auto-approve \
+            -no-color
+
+      - name: Release state lock on failure
+        if: failure() || cancelled()
+        run: |
+          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
