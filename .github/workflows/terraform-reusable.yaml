@@ -1,18 +1,22 @@
 name: Terraform Reusable Workflow
 
 # Called by terraform-dev.yml / terraform-qa.yml / terraform-prod.yml.
-# Behaviour (same for every environment):
-#   PR touching environments/<env>/**            -> plan only
-#   Push to master touching environments/<env>/** -> plan, then apply (waits on the
-#                                                    GitHub Environment approval gate)
-#   Push to any other branch                     -> plan only (safety net)
-#   workflow_dispatch                             -> plan / apply / destroy on demand
+#
+# Every subfolder under environments/<env>/ (networking, iam, rds, eks,
+# compute, s3, ... or any new folder added later) is its OWN independent
+# Terraform root module with its own state file. A change to one folder
+# only plans/applies/destroys that folder - the others are left alone.
+#
+# The order modules are applied in - and, in reverse, destroyed in - comes
+# from one small file: .github/terraform-module-order.json
+# A module that isn't listed there yet just runs last; nothing in this
+# workflow needs editing when a new folder is added.
 
 on:
   workflow_call:
     inputs:
       environment:
-        description: 'Target environment name. Must match the environments/<environment> folder and a GitHub Environment of the same name.'
+        description: 'Target environment name (dev, qa, prod). Must match environments/<environment> and a GitHub Environment of the same name.'
         required: true
         type: string
       action:
@@ -20,6 +24,11 @@ on:
         required: false
         type: string
         default: 'plan'
+      module_name:
+        description: 'Single module folder to target manually (e.g. "s3"). Type "all" to target every module. Leave blank to auto-detect from changed files.'
+        required: false
+        type: string
+        default: ''
       confirm_destroy:
         description: 'Must equal "destroy" to allow the destroy job to run'
         required: false
@@ -37,22 +46,83 @@ permissions:
 env:
   TF_VERSION: '1.15.6'
   AWS_REGION: 'ap-south-1'
-  TF_WORKING_DIR: environments/${{ inputs.environment }}
+  ENV_DIR: environments/${{ inputs.environment }}
+  ORDER_FILE: .github/terraform-module-order.json
 
-# One concurrency lane per environment so dev/qa/prod never block each other,
-# but two runs against the *same* environment queue instead of racing.
 concurrency:
   group: terraform-${{ inputs.environment }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # ---------- plan ----------
+  # ---------- work out WHICH module folders to touch, and in what order ----------
+  detect:
+    name: "Resolve target modules (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.resolve.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # full history, so we can diff against the previous commit
+
+      - name: Resolve module list
+        id: resolve
+        run: |
+          set -euo pipefail
+          ALL_ORDERED=$(jq -r '.order[]' "${{ env.ORDER_FILE }}")
+
+          if [ -n "${{ inputs.module_name }}" ] && [ "${{ inputs.module_name }}" != "all" ]; then
+            # A single module named manually, e.g. destroying just "s3"
+            MODULES_JSON=$(jq -cn --arg m "${{ inputs.module_name }}" '[$m]')
+
+          elif [ "${{ inputs.module_name }}" = "all" ]; then
+            # Every module, in dependency order
+            MODULES_JSON=$(printf '%s\n' "$ALL_ORDERED" | jq -R -s -c 'split("\n") | map(select(length>0))')
+
+          else
+            # Nothing named manually -> work out what actually changed
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              BASE_SHA="${{ github.event.pull_request.base.sha }}"
+              HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            else
+              BASE_SHA="${{ github.event.before }}"
+              HEAD_SHA="${{ github.sha }}"
+            fi
+
+            ZERO_SHA="0000000000000000000000000000000000000000"
+            if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "$ZERO_SHA" ]; then
+              # First commit on a new branch - no previous commit to diff against.
+              # Safe default: treat every module as a candidate.
+              CHANGED_DIRS="$ALL_ORDERED"
+            else
+              CHANGED_DIRS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "${{ env.ENV_DIR }}/" \
+                | awk -F/ '{print $3}' | sort -u)
+            fi
+
+            FINAL=""
+            for m in $ALL_ORDERED; do
+              if printf '%s\n' "$CHANGED_DIRS" | grep -qx "$m"; then
+                FINAL="$FINAL$m"$'\n'
+              fi
+            done
+            for m in $CHANGED_DIRS; do
+              if [ -n "$m" ] && ! printf '%s\n' "$ALL_ORDERED" | grep -qx "$m"; then
+                FINAL="$FINAL$m"$'\n'
+              fi
+            done
+
+            MODULES_JSON=$(printf '%s' "$FINAL" | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length>0))')
+          fi
+
+          echo "modules=$MODULES_JSON" >> "$GITHUB_OUTPUT"
+          echo "Resolved modules (apply order): $MODULES_JSON"
+
+  # ---------- plan every resolved module, in dependency order ----------
   plan:
     name: "Terraform plan (${{ inputs.environment }})"
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+    needs: detect
+    if: needs.detect.result == 'success' && needs.detect.outputs.modules != '[]'
     steps:
       - uses: actions/checkout@v5
 
@@ -69,57 +139,51 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           # Static keys for now - swap to an OIDC role-to-assume for production use.
 
-      - name: Terraform format check
-        id: fmt
-        run: terraform fmt -check -recursive
-        continue-on-error: true
-
-      - name: Terraform init
-        id: init
-        run: terraform init
-
-      - name: Terraform validate
-        id: validate
-        run: terraform validate -no-color
-
-      - name: Terraform plan
-        id: plan
+      - name: Plan each module
         run: |
-          terraform plan \
-            -var-file=terraform.tfvars \
-            -out=tfplan \
-            -no-color
-        continue-on-error: true
+          set -euo pipefail
+          mkdir -p /tmp/plans
+          for module in $(echo '${{ needs.detect.outputs.modules }}' | jq -r '.[]'); do
+            echo "::group::Plan: $module"
+            cd "${{ env.ENV_DIR }}/$module"
+            terraform fmt -check -recursive
+            terraform init -input=false
+            terraform validate -no-color
+            terraform plan -var-file=terraform.tfvars -out=tfplan -no-color
+            cd "$GITHUB_WORKSPACE"
+            mkdir -p "/tmp/plans/$module"
+            cp "${{ env.ENV_DIR }}/$module/tfplan" "/tmp/plans/$module/tfplan"
+            echo "::endgroup::"
+          done
 
-      - name: Fail job if plan failed
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
-
-      - name: Release state lock on failure
+      - name: Release state locks on failure
         if: failure() || cancelled()
         run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
+          for module in $(echo '${{ needs.detect.outputs.modules }}' | jq -r '.[]'); do
+            aws s3 rm "s3://${{ vars.TF_STATE_BUCKET }}/${{ env.ENV_DIR }}/$module/terraform.tfstate.tflock" || true
+          done
 
-      - name: Upload plan artifact
-        if: steps.plan.outcome == 'success'
+      - name: Upload plan artifacts
         uses: actions/upload-artifact@v6
         with:
           name: tfplan-${{ inputs.environment }}
-          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          path: /tmp/plans
           retention-days: 1
 
-  # ---------- apply ----------
+  # ---------- apply every resolved module, in the SAME dependency order ----------
   apply:
     name: "Terraform apply (${{ inputs.environment }})"
     runs-on: ubuntu-latest
-    needs: plan
+    needs: [detect, plan]
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-      (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+      needs.detect.result == 'success' &&
+      needs.plan.result == 'success' &&
+      needs.detect.outputs.modules != '[]' &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+      )
     environment: ${{ inputs.environment }}   # <- pauses for the environment's required reviewers
-    defaults:
-      run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
     steps:
       - uses: actions/checkout@v5
 
@@ -135,40 +199,51 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform init
-        run: terraform init
-
-      - name: Download plan artifact
+      - name: Download plan artifacts
         uses: actions/download-artifact@v7
         with:
           name: tfplan-${{ inputs.environment }}
-          path: ${{ env.TF_WORKING_DIR }}
+          path: /tmp/plans
 
-      - name: Terraform apply
+      - name: Apply each module
         run: |
-          terraform apply \
-            -auto-approve \
-            -no-color \
-            tfplan
+          set -euo pipefail
+          for module in $(echo '${{ needs.detect.outputs.modules }}' | jq -r '.[]'); do
+            echo "::group::Apply: $module"
+            cp "/tmp/plans/$module/tfplan" "${{ env.ENV_DIR }}/$module/tfplan"
+            cd "${{ env.ENV_DIR }}/$module"
+            terraform init -input=false
+            terraform apply -auto-approve -no-color tfplan
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
 
-      - name: Release state lock on failure
+      - name: Release state locks on failure
         if: failure() || cancelled()
         run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
+          for module in $(echo '${{ needs.detect.outputs.modules }}' | jq -r '.[]'); do
+            aws s3 rm "s3://${{ vars.TF_STATE_BUCKET }}/${{ env.ENV_DIR }}/$module/terraform.tfstate.tflock" || true
+          done
 
-  # ---------- destroy ----------
+  # ---------- destroy resolved module(s), in REVERSE dependency order ----------
   destroy:
     name: "Terraform destroy (${{ inputs.environment }})"
     runs-on: ubuntu-latest
+    needs: detect
     if: |
+      needs.detect.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.action == 'destroy' &&
       inputs.confirm_destroy == 'destroy'
     environment: ${{ inputs.environment }}
-    defaults:
-      run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
     steps:
+      - name: Require an explicit target
+        run: |
+          if [ -z "${{ inputs.module_name }}" ]; then
+            echo "::error::Refusing to destroy - set 'module_name' to one folder, or 'all' to tear down every module on purpose."
+            exit 1
+          fi
+
       - uses: actions/checkout@v5
 
       - name: Setup Terraform ${{ env.TF_VERSION }}
@@ -183,17 +258,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform init
-        run: terraform init
-
-      - name: Terraform destroy
+      - name: Destroy each module, dependents first
         run: |
-          terraform destroy \
-            -var-file=terraform.tfvars \
-            -auto-approve \
-            -no-color
+          set -euo pipefail
+          REVERSED=$(echo '${{ needs.detect.outputs.modules }}' | jq -r 'reverse[]')
+          for module in $REVERSED; do
+            echo "::group::Destroy: $module"
+            cd "${{ env.ENV_DIR }}/$module"
+            terraform init -input=false
+            terraform destroy -var-file=terraform.tfvars -auto-approve -no-color
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
 
-      - name: Release state lock on failure
+      - name: Release state locks on failure
         if: failure() || cancelled()
         run: |
-          aws s3 rm s3://${{ vars.TF_STATE_BUCKET }}/${{ env.TF_WORKING_DIR }}/terraform.tfstate.tflock || true
+          for module in $(echo '${{ needs.detect.outputs.modules }}' | jq -r '.[]'); do
+            aws s3 rm "s3://${{ vars.TF_STATE_BUCKET }}/${{ env.ENV_DIR }}/$module/terraform.tfstate.tflock" || true
+          done

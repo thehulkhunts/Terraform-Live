@@ -17,6 +17,10 @@ on:
         type: choice
         default: 'plan'
         options: [plan, apply, destroy]
+      module_name:
+        description: 'Module folder to target, e.g. "s3" (leave blank to auto-detect changed folders; "all" for every module)'
+        required: false
+        default: ''
       confirm_destroy:
         description: 'Type "destroy" to confirm destruction (only used when action=destroy)'
         required: false
@@ -28,5 +32,6 @@ jobs:
     with:
       environment: prod
       action: ${{ github.event.inputs.action || 'plan' }}
+      module_name: ${{ github.event.inputs.module_name || '' }}
       confirm_destroy: ${{ github.event.inputs.confirm_destroy || '' }}
     secrets: inherit
