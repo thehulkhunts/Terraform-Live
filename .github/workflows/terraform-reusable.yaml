@@ -73,7 +73,13 @@ jobs:
 
           if [ -n "${{ inputs.module_name }}" ] && [ "${{ inputs.module_name }}" != "all" ]; then
             # A single module named manually, e.g. destroying just "s3"
-            MODULES_JSON=$(jq -cn --arg m "${{ inputs.module_name }}" '[$m]')
+            MODULE="${{ inputs.module_name }}"
+            if [ ! -d "${{ env.ENV_DIR }}/$MODULE" ]; then
+              AVAILABLE=$(ls -1 "${{ env.ENV_DIR }}" | tr '\n' ' ')
+              echo "::error::Module '$MODULE' does not exist under ${{ env.ENV_DIR }}. Available modules: $AVAILABLE"
+              exit 1
+            fi
+            MODULES_JSON=$(jq -cn --arg m "$MODULE" '[$m]')
 
           elif [ "${{ inputs.module_name }}" = "all" ]; then
             # Every module, in dependency order
