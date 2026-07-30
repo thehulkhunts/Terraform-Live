@@ -16,13 +16,21 @@ on:
         required: true
         type: choice
         default: 'plan'
-        options: [plan, apply, destroy]
+        options: [plan, apply, destroy, unlock]
       module_name:
-        description: 'Module folder to target, e.g. "s3" (leave blank to auto-detect changed folders; "all" for every module)'
+        description: 'Module folder to target, e.g. "s3" (leave blank to auto-detect changed folders; "all" for every module - not valid for unlock)'
+        required: false
+        default: ''
+      lock_id:
+        description: 'Lock ID to release (only used when action=unlock) - copy from the failed run''s "Lock Info" error output'
         required: false
         default: ''
       confirm_destroy:
         description: 'Type "destroy" to confirm destruction (only used when action=destroy)'
+        required: false
+        default: ''
+      confirm_unlock:
+        description: 'Type "unlock" to confirm the force-unlock (only used when action=unlock)'
         required: false
         default: ''
 
@@ -33,5 +41,7 @@ jobs:
       environment: qa
       action: ${{ github.event.inputs.action || 'plan' }}
       module_name: ${{ github.event.inputs.module_name || '' }}
+      lock_id: ${{ github.event.inputs.lock_id || '' }}
       confirm_destroy: ${{ github.event.inputs.confirm_destroy || '' }}
+      confirm_unlock: ${{ github.event.inputs.confirm_unlock || '' }}
     secrets: inherit
