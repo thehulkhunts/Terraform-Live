@@ -1,0 +1,4 @@
+{
+  "//": "Apply order left-to-right. Destroy runs this list in REVERSE. A module folder that exists under environments/<env>/ but is NOT listed here is still detected and run - it is simply added to the end of the list automatically.",
+  "order": ["networking", "iam", "rds", "eks", "compute", "s3"]
+}
