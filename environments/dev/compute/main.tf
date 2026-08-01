@@ -1,6 +1,7 @@
 module "ec2" {
   source      = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/compute/ec2/v1.1.0"
   environment = var.environment
+  tags        = var.common_tags
 
   ec2_instances = {
     for name, instance in var.ec2_instances :

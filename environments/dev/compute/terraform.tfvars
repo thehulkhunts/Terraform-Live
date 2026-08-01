@@ -118,7 +118,7 @@ security_groups = {
 //common tags for all resources
 common_tags = {
   Environment = "dev"
-  Owner       = "DevOps Team,platform-team"
+  Owner       = "DevOps-Team,platform-team"
   Project     = "aws-ec2-terraform"
   ManagedBy   = "Terraform"
 }
