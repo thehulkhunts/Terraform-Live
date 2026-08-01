@@ -1,5 +1,5 @@
 module "ec2" {
-  source      = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/compute/ec2/v1.1.0"
+  source      = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/compute/ec2/v1.2.0"
   environment = var.environment
   tags        = var.common_tags
 
@@ -24,7 +24,7 @@ module "ec2" {
 }
 
 module "vpc_security_groups" {
-  source          = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/networking/security_groups/v1.2.0"
+  source          = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/networking/security_groups/v1.3.0"
   security_groups = var.security_groups
   vpc_id          = data.terraform_remote_state.networking.outputs.vpc_id
   tags            = var.common_tags
