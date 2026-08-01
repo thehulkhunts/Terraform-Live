@@ -26,4 +26,5 @@ module "vpc_security_groups" {
   source          = "git::https://github.com/thehulkhunts/aws-terraform-modules-releaser.git?ref=aws/modules/networking/security_groups/v1.2.0"
   security_groups = var.security_groups
   vpc_id          = data.terraform_remote_state.networking.outputs.vpc_id
+  tags            = var.common_tags
 }

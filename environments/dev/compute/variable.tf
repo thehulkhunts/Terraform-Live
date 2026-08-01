@@ -43,6 +43,10 @@ variable "security_groups" {
       cidr_blocks = list(string)
 
     }))
-    tags = map(string)
+    
   }))
+}
+variable "common_tags" {
+  description = "Common tags to apply to all resources"
+  type        = map(string)
 }
