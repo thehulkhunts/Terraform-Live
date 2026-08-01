@@ -22,3 +22,9 @@ variable "aws_region" {
   type = string
   description = "AWS region"
 }
+
+//reusable common tags 
+variable "common_tags" {
+  type = map(string)
+  description = "common tags for all resources"
+}
